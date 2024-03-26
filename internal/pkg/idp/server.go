@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -33,9 +32,11 @@ type Server struct {
 	http.Handler
 	idpConfigMu      sync.RWMutex // protects calls into the IDP
 	serviceProviders map[string]*saml.EntityDescriptor
-	IDP              saml.IdentityProvider // the underlying IDP
+	Idp              saml.IdentityProvider // the underlying IDP
 	oauth2Config     oauth2.Config
 	oidcProvider     *oidc.Provider
+	secureCookie     *securecookie.SecureCookie
+	logger           logger.Interface
 }
 
 func New(
@@ -49,7 +50,15 @@ func New(
 	oidcIssuer string,
 	oidcClient string,
 	oidcClientSecret string,
+	secureCookie *securecookie.SecureCookie,
 ) (*Server, error) {
+
+	if len(metadataPath) == 0 {
+		metadataPath = "/metadata"
+	}
+	if len(ssoPath) == 0 {
+		ssoPath = "/sso"
+	}
 
 	metadataURL := baseUrl
 	metadataURL.Path += metadataPath
@@ -58,13 +67,12 @@ func New(
 
 	oidcProvider, err := oidc.NewProvider(context.Background(), oidcIssuer)
 	if err != nil {
-		fmt.Println(err)
-		// handle error
+		return nil, err
 	}
 
 	server := &Server{
 		serviceProviders: map[string]*saml.EntityDescriptor{},
-		IDP: saml.IdentityProvider{
+		Idp: saml.IdentityProvider{
 			Key:         key,
 			Signer:      signer,
 			Logger:      logger,
@@ -84,15 +92,17 @@ func New(
 			Scopes: []string{oidc.ScopeOpenID, "profile", "email"},
 		},
 		oidcProvider: oidcProvider,
+		secureCookie: secureCookie,
+		logger:       logger,
 	}
 
-	server.IDP.SessionProvider = server
-	server.IDP.ServiceProviderProvider = server
+	server.Idp.SessionProvider = server
+	server.Idp.ServiceProviderProvider = server
 
 	server.loadServiceProviders()
 
 	/**
-		WEBSERVICE
+	    WEBSERVICE
 	**/
 	mux := web.New()
 	server.Handler = mux
@@ -100,12 +110,12 @@ func New(
 	mux.Get(metadataPath, func(w http.ResponseWriter, r *http.Request) {
 		server.idpConfigMu.RLock()
 		defer server.idpConfigMu.RUnlock()
-		server.IDP.ServeMetadata(w, r)
+		server.Idp.ServeMetadata(w, r)
 	})
 	mux.Handle(ssoPath, func(w http.ResponseWriter, r *http.Request) {
 		server.idpConfigMu.RLock()
 		defer server.idpConfigMu.RUnlock()
-		server.IDP.ServeSSO(w, r)
+		server.Idp.ServeSSO(w, r)
 	})
 	mux.Handle("/oauth/v2/callback", func(w http.ResponseWriter, r *http.Request) {
 		server.idpConfigMu.RLock()
@@ -113,18 +123,10 @@ func New(
 		handleOAuth2Callback(server, w, r)
 	})
 
-	fmt.Println("Loaded SP={}", server.serviceProviders)
+	server.logger.Println("SP loaded=%s", server.serviceProviders)
 
 	return server, nil
 }
-
-// Hash keys should be at least 32 bytes long
-var hashKey = []byte("PIhdJgTHlTMofskoXXPozQka6r7gwJ6u")
-
-// Block keys should be 16 bytes (AES-128) or 32 bytes (AES-256) long.
-// Shorter keys may weaken the encryption used.
-var blockKey = []byte("C9BagPBnef3oVEDahucNx4iJVVk1itb8")
-var sc = securecookie.New(hashKey, blockKey)
 
 func randomBytes(n int) []byte {
 	rv := make([]byte, n)
@@ -134,12 +136,9 @@ func randomBytes(n int) []byte {
 	return rv
 }
 
-func (s *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.IdpAuthnRequest) *saml.Session {
+func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.IdpAuthnRequest) *saml.Session {
 
-	cookie, err := r.Cookie("_authn")
-
-	// NO COOKIE FOUND
-	if err != nil {
+	if _, err := r.Cookie("_authn"); err != nil {
 
 		state := uuid.New().String()
 
@@ -148,10 +147,7 @@ func (s *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.Id
 			"SAMLRequest": r.URL.Query().Get("SAMLRequest"),
 		}
 
-		fmt.Println("value=" + fmt.Sprint(value))
-
-		if encoded, err := sc.Encode("_session", value); err == nil {
-			fmt.Println("encoded=" + encoded)
+		if encoded, err := server.secureCookie.Encode("_session", value); err == nil {
 			cookie := &http.Cookie{
 				Name:     "_session",
 				Value:    encoded,
@@ -160,7 +156,7 @@ func (s *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.Id
 				HttpOnly: true,
 			}
 			http.SetCookie(w, cookie)
-			http.Redirect(w, r, s.oauth2Config.AuthCodeURL(state), http.StatusFound)
+			http.Redirect(w, r, server.oauth2Config.AuthCodeURL(state), http.StatusFound)
 			return nil
 		}
 
@@ -168,17 +164,15 @@ func (s *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.Id
 		return nil
 	}
 
-	fmt.Println("Cookie found {}", cookie.Raw)
-
 	if cookie, err := r.Cookie("_authn"); err == nil {
 
 		value := make(map[string]string)
-		if err = sc.Decode("_authn", cookie.Value, &value); err == nil {
+		if err = server.secureCookie.Decode("_authn", cookie.Value, &value); err == nil {
 
-			fmt.Println("id_token=" + value["id_token"])
+			server.logger.Println("Trying to parse and validate id_token=%s", value["id_token"])
 
 			// Parse and verify ID Token payload.
-			idToken, err := s.oidcProvider.Verifier(&oidc.Config{ClientID: s.oauth2Config.ClientID}).Verify(r.Context(), value["id_token"])
+			idToken, err := server.oidcProvider.Verifier(&oidc.Config{ClientID: server.oauth2Config.ClientID}).Verify(r.Context(), value["id_token"])
 
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -194,8 +188,6 @@ func (s *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.Id
 				http.Error(w, err.Error(), http.StatusBadRequest)
 			}
 
-			fmt.Println("claims.Subject=" + claims.Subject)
-
 			session := &saml.Session{
 				ID:         base64.StdEncoding.EncodeToString(randomBytes(32)),
 				CreateTime: saml.TimeNow(),
@@ -203,12 +195,12 @@ func (s *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.Id
 				Index:      hex.EncodeToString(randomBytes(32)),
 				NameID:     claims.Subject,
 				/*
-					Groups:                []string{"group01", "group02"},
-					UserEmail:             "test@test.com",
-					UserCommonName:        "UserCommonName",
-					UserSurname:           "UserSurname",
-					UserGivenName:         "UserGivenName",
-					UserScopedAffiliation: "UserScopedAffiliation",
+				   Groups:                []string{"group01", "group02"},
+				   UserEmail:             "test@test.com",
+				   UserCommonName:        "UserCommonName",
+				   UserSurname:           "UserSurname",
+				   UserGivenName:         "UserGivenName",
+				   UserScopedAffiliation: "UserScopedAffiliation",
 				*/
 			}
 
@@ -239,12 +231,10 @@ func (s *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.Id
 
 }
 
-func (s *Server) GetServiceProvider(_ *http.Request, serviceProviderID string) (*saml.EntityDescriptor, error) {
-	fmt.Println("Fetching serviceProviderID={}", serviceProviderID)
-
-	s.idpConfigMu.RLock()
-	defer s.idpConfigMu.RUnlock()
-	rv, ok := s.serviceProviders[serviceProviderID]
+func (server *Server) GetServiceProvider(_ *http.Request, serviceProviderID string) (*saml.EntityDescriptor, error) {
+	server.idpConfigMu.RLock()
+	defer server.idpConfigMu.RUnlock()
+	rv, ok := server.serviceProviders[serviceProviderID]
 	if !ok {
 		return nil, os.ErrNotExist
 	}
@@ -254,35 +244,37 @@ func (s *Server) GetServiceProvider(_ *http.Request, serviceProviderID string) (
 func handleOAuth2Callback(server *Server, w http.ResponseWriter, r *http.Request) {
 
 	if cookie, err := r.Cookie("_session"); err == nil {
-		fmt.Println("cookie.Value=" + cookie.Value)
 
 		value := make(map[string]string)
 
-		if err = sc.Decode("_session", cookie.Value, &value); err == nil {
+		if err = server.secureCookie.Decode("_session", cookie.Value, &value); err == nil {
 			samlRequest := url.QueryEscape(value["SAMLRequest"])
 			state := value["state"]
-			fmt.Println("SAMLRequest=" + samlRequest)
-			fmt.Println("state=" + samlRequest)
+
+			server.logger.Println("SAMLRequest=%s, state=%s", samlRequest, state)
 
 			if r.URL.Query().Get("state") != state {
-				http.Error(w, "Invalid state", http.StatusBadRequest)
+				server.logger.Println("state=%s, did not match state=%s", state, r.URL.Query().Get("state"))
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			}
 
 			oauth2Token, err := server.oauth2Config.Exchange(r.Context(), r.URL.Query().Get("code"))
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				server.logger.Println(err.Error())
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			}
 
 			// Extract the ID Token from OAuth2 token.
 			rawIDToken, ok := oauth2Token.Extra("id_token").(string)
 			if !ok {
-				http.Error(w, "Invalid id_token", http.StatusBadRequest)
+				server.logger.Println("Invalid id_token")
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			}
 
 			value := map[string]string{
 				"id_token": rawIDToken,
 			}
-			if encoded, err := sc.Encode("_authn", value); err == nil {
+			if encoded, err := server.secureCookie.Encode("_authn", value); err == nil {
 				cookie := &http.Cookie{
 					Name:     "_authn",
 					Value:    encoded,
@@ -298,36 +290,36 @@ func handleOAuth2Callback(server *Server, w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	http.Error(w, "Internal server error", http.StatusInternalServerError)
+	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 
 }
 
-func (s *Server) loadServiceProviders() {
+func (server *Server) loadServiceProviders() {
 	pattern := "*.xml"
 	files, err := filepath.Glob(pattern)
 	if err != nil {
-		fmt.Println("Error:", err)
+		server.logger.Fatalln(err)
 		return
 	}
-	fmt.Println("Found SP configuration:", files)
+	server.logger.Println("Found SP configuration=%s", files)
 
 	for _, f := range files {
 		reader, err := os.Open(f)
 
 		if err != nil {
-			fmt.Println("File reading error", err)
+			server.logger.Fatalln(err)
 			return
 		}
 
 		metadata, err := getSPMetadata(reader)
 		if err != nil {
-			fmt.Println("File reading error", err)
+			server.logger.Fatalln(err)
 			return
 		}
 
-		s.idpConfigMu.Lock()
-		s.serviceProviders[metadata.EntityID] = metadata
-		s.idpConfigMu.Unlock()
+		server.idpConfigMu.Lock()
+		server.serviceProviders[metadata.EntityID] = metadata
+		server.idpConfigMu.Unlock()
 
 		reader.Close()
 	}
