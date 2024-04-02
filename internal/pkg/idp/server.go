@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -37,9 +38,10 @@ type Server struct {
 	oidcProvider     *oidc.Provider
 	secureCookie     *securecookie.SecureCookie
 	logger           logger.Interface
+	scriptRuntime    *ScriptRuntime
 }
 
-func New(
+func NewServer(
 	baseUrl url.URL,
 	metadataPath string,
 	ssoPath string,
@@ -51,6 +53,7 @@ func New(
 	oidcClient string,
 	oidcClientSecret string,
 	secureCookie *securecookie.SecureCookie,
+	script string,
 ) (*Server, error) {
 
 	if len(metadataPath) == 0 {
@@ -70,15 +73,21 @@ func New(
 		return nil, err
 	}
 
+	scriptRuntime, err := NewScriptRuntime(script, logger)
+	if err != nil {
+		return nil, err
+	}
+
 	server := &Server{
 		serviceProviders: map[string]*saml.EntityDescriptor{},
 		Idp: saml.IdentityProvider{
-			Key:         key,
-			Signer:      signer,
-			Logger:      logger,
-			Certificate: certificate,
-			MetadataURL: metadataURL,
-			SSOURL:      ssoURL,
+			Key:            key,
+			Signer:         signer,
+			Logger:         logger,
+			Certificate:    certificate,
+			MetadataURL:    metadataURL,
+			SSOURL:         ssoURL,
+			AssertionMaker: OpenIdConnectAssertionMaker{},
 		},
 		oauth2Config: oauth2.Config{
 			ClientID:     oidcClient,
@@ -91,9 +100,10 @@ func New(
 			// "openid" is a required scope for OpenID Connect flows.
 			Scopes: []string{oidc.ScopeOpenID, "profile", "email"},
 		},
-		oidcProvider: oidcProvider,
-		secureCookie: secureCookie,
-		logger:       logger,
+		oidcProvider:  oidcProvider,
+		secureCookie:  secureCookie,
+		logger:        logger,
+		scriptRuntime: scriptRuntime,
 	}
 
 	server.Idp.SessionProvider = server
@@ -156,7 +166,28 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 				HttpOnly: true,
 			}
 			http.SetCookie(w, cookie)
-			http.Redirect(w, r, server.oauth2Config.AuthCodeURL(state), http.StatusFound)
+
+			inboundContext := &InboundContext{
+				AcrContext: req.Request.RequestedAuthnContext.AuthnContextClassRef,
+			}
+			if req.Request.ForceAuthn != nil {
+				inboundContext.ForceAuthn = *req.Request.ForceAuthn
+			}
+
+			output, err := server.scriptRuntime.ProcessInbound(inboundContext)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			}
+
+			opts := []oauth2.AuthCodeOption{}
+			if output.AcrValues != nil {
+				opts = append(opts, oauth2.SetAuthURLParam("acr_values", output.AcrValues.(string)))
+			}
+			if output.Prompt != nil {
+				opts = append(opts, oauth2.SetAuthURLParam("prompt", output.Prompt.(string)))
+			}
+
+			http.Redirect(w, r, server.oauth2Config.AuthCodeURL(state, opts...), http.StatusFound)
 			return nil
 		}
 
@@ -179,13 +210,41 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 			}
 
 			// Extract custom claims
-			var claims struct {
-				Subject  string `json:"sub"`
-				Email    string `json:"email"`
-				Verified bool   `json:"email_verified"`
-			}
+			var claims map[string]interface{}
 			if err := idToken.Claims(&claims); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
+			}
+
+			output, err := server.scriptRuntime.ProcessOutbound(&OutboundContext{
+				Claims: claims,
+			})
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			}
+
+			attributes := []saml.Attribute{}
+
+			for idx, attr := range output.Attributes {
+				switch v := attr.(type) {
+				case string:
+					attributes = append(attributes, saml.Attribute{
+						Name: idx,
+						Values: []saml.AttributeValue{{
+							Type:  "xs:string",
+							Value: v,
+						}},
+					})
+				case float64:
+					attributes = append(attributes, saml.Attribute{
+						Name: idx,
+						Values: []saml.AttributeValue{{
+							Type:  "xs:integer",
+							Value: fmt.Sprintf("%f", v),
+						}},
+					})
+				default:
+					// t is some other type that we didn't name.
+				}
 			}
 
 			session := &saml.Session{
@@ -193,7 +252,7 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 				CreateTime: saml.TimeNow(),
 				ExpireTime: saml.TimeNow().Add(time.Hour),
 				Index:      hex.EncodeToString(randomBytes(32)),
-				NameID:     claims.Subject,
+				NameID:     output.NameID,
 				/*
 				   Groups:                []string{"group01", "group02"},
 				   UserEmail:             "test@test.com",
@@ -202,6 +261,7 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 				   UserGivenName:         "UserGivenName",
 				   UserScopedAffiliation: "UserScopedAffiliation",
 				*/
+				CustomAttributes: attributes,
 			}
 
 			// Remove session cookie

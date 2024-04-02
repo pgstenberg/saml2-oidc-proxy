@@ -55,3 +55,48 @@ saml2_identity_provider:
     GFsTG2DLxnvr4GdN1BSr0Uu/KV3adj47WkXVPeMYQti/bQmxQB8tRFhrw80qakTL
     UzreO96WzlBBMtY=
     -----END CERTIFICATE-----
+
+server:
+  script: |
+    /*
+      SCRIPT FOR OUTBOUND TRAFFIC (FROM OIDC PROVIDER)
+    */
+    function outbound(context) {
+    
+    	const STANDARD_OIDC_CLAIMS = [
+    		'iss', 
+    		'sub',
+    		'aud',
+    		'exp',
+    		'iat',
+    		'auth_time',
+    		'nonce',
+    		'acr',
+    		'amr',
+    		'azp'
+    	];
+
+    	return {
+    		attributes: Object.keys(context.claims)
+    			.filter(key => !STANDARD_OIDC_CLAIMS.includes(key))
+    			.reduce((obj, key) => {
+    			  obj[key] = context.claims[key];
+    			  return obj;
+    			}, {}),
+    		name_id: context.claims.sub
+    	}
+    }
+
+    /*
+      SCRIPT FOR INBOUND TRAFFIC (FROM SAML2 CLIENT)
+    */
+    function inbound(context) {
+    
+    	if(context['force_authn']){
+    		return {
+    			prompt: 'login'
+    		}
+    	}
+
+    	return {}
+    }

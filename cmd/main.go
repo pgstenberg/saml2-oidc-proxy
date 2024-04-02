@@ -16,7 +16,46 @@ import (
 	"github.com/zenazn/goji"
 )
 
+type User struct {
+	Name       string            `json:"name"`
+	Attributes map[string]string `json:"attributes"`
+}
+
 func main() {
+
+	/*
+		user := &User{
+			Name: "test321321",
+			Attributes: map[string]string{
+				"test1": "abc",
+				"test2": "fafda",
+			},
+		}
+
+		const SCRIPT = `
+		function test(user) {
+			return user.attributes["test1"];
+		}
+		`
+
+		vm := goja.New()
+		vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", false))
+		_, err := vm.RunString(SCRIPT)
+		if err != nil {
+			panic(err)
+		}
+		test, ok := goja.AssertFunction(vm.Get("test"))
+		if !ok {
+			panic("Not a function")
+		}
+
+		res, err := test(goja.Undefined(), vm.ToValue(user))
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println(res)
+	*/
+
 	var cfg idp.Config
 
 	configFile := flag.String("config", "", "Configuration file to be used.")
@@ -50,7 +89,7 @@ func main() {
 
 	sc := securecookie.New([]byte(cfg.Saml2IdentityProvider.CookieHashKey), []byte(cfg.Saml2IdentityProvider.CookieEncryptionKey))
 
-	idpServer, err := idp.New(
+	idpServer, err := idp.NewServer(
 		*baseURL,
 		cfg.Saml2IdentityProvider.MetadataPath,
 		cfg.Saml2IdentityProvider.SsoPath,
@@ -62,6 +101,7 @@ func main() {
 		cfg.OpenIdConnectClient.ClientId,
 		cfg.OpenIdConnectClient.ClientSecret,
 		sc,
+		cfg.Server.Script,
 	)
 
 	if err != nil {
