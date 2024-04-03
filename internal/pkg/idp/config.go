@@ -24,23 +24,23 @@ type Config struct {
 		ClientSecret string `yaml:"client_secret", envconfig:"OIDC_CLIENT_SECRET"`
 	} `yaml:"openid_connect_client"`
 	Server struct {
-		Script string `yaml:"script", envconfig:"SERVER_SCRIPT"`
+		Script *string `yaml:"script", envconfig:"SERVER_SCRIPT"`
 	} `yaml:"server"`
 }
 
-func ReadYaml(cfg *Config, filePath string) {
+func ReadYaml(cfg *Config, filePath string) error {
 	f, err := os.Open(filePath)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(2)
+		return err
 	}
 	defer f.Close()
 
 	decoder := yaml.NewDecoder(f)
 	if err := decoder.Decode(cfg); err != nil {
-		fmt.Println(err)
-		os.Exit(2)
+		return err
 	}
+
+	return nil
 }
 
 func ReadEnv(cfg *Config) {

@@ -15,12 +15,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc"
 	"github.com/crewjam/saml"
 	"github.com/crewjam/saml/logger"
+	"github.com/dop251/goja"
 	"github.com/google/uuid"
 	"github.com/gorilla/securecookie"
 	"github.com/zenazn/goji/web"
@@ -41,6 +43,51 @@ type Server struct {
 	scriptRuntime    *ScriptRuntime
 }
 
+const DEFAULT_SCRIPT = `
+/*
+SCRIPT FOR OUTBOUND TRAFFIC (FROM OIDC PROVIDER)
+*/
+function outbound(context) {
+
+  const STANDARD_OIDC_CLAIMS = [
+	  'iss', 
+	  'sub',
+	  'aud',
+	  'exp',
+	  'iat',
+	  'auth_time',
+	  'nonce',
+	  'acr',
+	  'amr',
+	  'azp'
+  ];
+
+  return {
+	  attributes: Object.keys(context.claims)
+		  .filter(key => !STANDARD_OIDC_CLAIMS.includes(key))
+		  .reduce((obj, key) => {
+			obj[key] = context.claims[key];
+			return obj;
+		  }, {}),
+	  nameID: context.claims.sub
+  }
+}
+
+/*
+SCRIPT FOR INBOUND TRAFFIC (FROM SAML2 CLIENT)
+*/
+function inbound(context) {
+
+  if(context.forceAuthn){
+	  return {
+		  prompt: 'login'
+	  }
+  }
+
+  return {}
+}
+`
+
 func NewServer(
 	baseUrl url.URL,
 	metadataPath string,
@@ -53,7 +100,6 @@ func NewServer(
 	oidcClient string,
 	oidcClientSecret string,
 	secureCookie *securecookie.SecureCookie,
-	script string,
 ) (*Server, error) {
 
 	if len(metadataPath) == 0 {
@@ -73,7 +119,7 @@ func NewServer(
 		return nil, err
 	}
 
-	scriptRuntime, err := NewScriptRuntime(script, logger)
+	scriptRuntime, err := NewScriptRuntime(logger)
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +192,44 @@ func randomBytes(n int) []byte {
 	return rv
 }
 
+func (server *Server) LoadScript(scriptFile *string) {
+
+	if scriptFile == nil || *scriptFile == "" {
+		defaultScript := DEFAULT_SCRIPT
+		server.scriptRuntime.script = &defaultScript
+		server.logger.Println("Script successfully loaded:\n" + *server.scriptRuntime.script)
+		return
+	}
+
+	f, err := os.ReadFile(*scriptFile)
+	if err != nil {
+		server.logger.Panicln(err)
+		return
+	}
+	scriptContent := string(f)
+
+	if scriptContent == "" {
+		return
+	}
+
+	_, err = server.scriptRuntime.vm.RunString(scriptContent)
+	if err != nil {
+		server.logger.Println(err)
+		return
+	}
+
+	server.scriptRuntime.script = &scriptContent
+
+	if inboundFunction, ok := goja.AssertFunction(server.scriptRuntime.vm.Get("inbound")); ok {
+		server.scriptRuntime.inboundFunction = inboundFunction
+	}
+	if outboundFunction, ok := goja.AssertFunction(server.scriptRuntime.vm.Get("outbound")); ok {
+		server.scriptRuntime.outboundFunction = outboundFunction
+	}
+
+	server.logger.Println("Script successfully loaded:\n" + *server.scriptRuntime.script)
+}
+
 func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.IdpAuthnRequest) *saml.Session {
 
 	if _, err := r.Cookie("_authn"); err != nil {
@@ -181,10 +265,10 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 
 			opts := []oauth2.AuthCodeOption{}
 			if output.AcrValues != nil {
-				opts = append(opts, oauth2.SetAuthURLParam("acr_values", output.AcrValues.(string)))
+				opts = append(opts, oauth2.SetAuthURLParam("acr_values", strings.Join(*output.AcrValues, " ")))
 			}
 			if output.Prompt != nil {
-				opts = append(opts, oauth2.SetAuthURLParam("prompt", output.Prompt.(string)))
+				opts = append(opts, oauth2.SetAuthURLParam("prompt", *output.Prompt))
 			}
 
 			http.Redirect(w, r, server.oauth2Config.AuthCodeURL(state, opts...), http.StatusFound)
@@ -252,7 +336,7 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 				CreateTime: saml.TimeNow(),
 				ExpireTime: saml.TimeNow().Add(time.Hour),
 				Index:      hex.EncodeToString(randomBytes(32)),
-				NameID:     output.NameID,
+				NameID:     output.NameID.(string),
 				/*
 				   Groups:                []string{"group01", "group02"},
 				   UserEmail:             "test@test.com",

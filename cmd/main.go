@@ -7,10 +7,12 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"flag"
+	"log"
 	"net/http"
 	"net/url"
 
 	"github.com/crewjam/saml/logger"
+	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/securecookie"
 	"github.com/pgstenberg/saml2-oidc-proxy/internal/pkg/idp"
 	"github.com/zenazn/goji"
@@ -23,42 +25,11 @@ type User struct {
 
 func main() {
 
-	/*
-		user := &User{
-			Name: "test321321",
-			Attributes: map[string]string{
-				"test1": "abc",
-				"test2": "fafda",
-			},
-		}
-
-		const SCRIPT = `
-		function test(user) {
-			return user.attributes["test1"];
-		}
-		`
-
-		vm := goja.New()
-		vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", false))
-		_, err := vm.RunString(SCRIPT)
-		if err != nil {
-			panic(err)
-		}
-		test, ok := goja.AssertFunction(vm.Get("test"))
-		if !ok {
-			panic("Not a function")
-		}
-
-		res, err := test(goja.Undefined(), vm.ToValue(user))
-		if err != nil {
-			panic(err)
-		}
-		fmt.Println(res)
-	*/
-
 	var cfg idp.Config
 
 	configFile := flag.String("config", "", "Configuration file to be used.")
+	scriptFile := flag.String("script", "", "Script file to be used.")
+
 	flag.Parse()
 	if *configFile != "" {
 		idp.ReadYaml(&cfg, *configFile)
@@ -101,11 +72,44 @@ func main() {
 		cfg.OpenIdConnectClient.ClientId,
 		cfg.OpenIdConnectClient.ClientSecret,
 		sc,
-		cfg.Server.Script,
 	)
+
+	idpServer.LoadScript(scriptFile)
 
 	if err != nil {
 		logr.Fatalf("%s", err)
+	}
+
+	// Create new watcher.
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer watcher.Close()
+
+	// Start listening for events.
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Has(fsnotify.Write) && event.Name == *scriptFile {
+					idpServer.LoadScript(scriptFile)
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				logr.Println(err)
+			}
+		}
+	}()
+
+	// Add a path.
+	if err = watcher.Add("."); err != nil {
+		logr.Fatalln(err)
 	}
 
 	goji.Handle("/*", idpServer)

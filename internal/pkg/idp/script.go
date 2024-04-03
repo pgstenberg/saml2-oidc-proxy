@@ -7,6 +7,7 @@ import (
 
 type ScriptRuntime struct {
 	vm               *goja.Runtime
+	script           *string
 	outboundFunction goja.Callable
 	inboundFunction  goja.Callable
 }
@@ -28,46 +29,31 @@ func newConsole(vm *goja.Runtime, logger logger.Interface) *goja.Object {
 }
 
 type InboundOutput struct {
-	AcrValues interface{} `json:"acr_values"`
-	Prompt    interface{} `json:"prompt"`
+	AcrValues *[]string
+	Prompt    *string
 }
 type InboundContext struct {
-	AcrContext string `json:"acr_context"`
-	ForceAuthn bool   `json:"force_authn"`
+	AcrContext string
+	ForceAuthn bool
 }
 type OutboundOutput struct {
-	Attributes map[string]interface{} `json:"attributes"`
-	NameID     string                 `json:"name_id"`
+	Attributes map[string]interface{}
+	NameID     interface{}
 }
 type OutboundContext struct {
-	Claims map[string]interface{} `json:"claims"`
+	Claims map[string]interface{}
 }
 
-func NewScriptRuntime(scriptContent string, logger logger.Interface) (*ScriptRuntime, error) {
+func NewScriptRuntime(logger logger.Interface) (*ScriptRuntime, error) {
 
 	vm := goja.New()
-	vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", false))
+	vm.SetFieldNameMapper(goja.UncapFieldNameMapper())
 
 	c := newConsole(vm, logger)
 	vm.Set("console", c)
 
-	_, err := vm.RunString(scriptContent)
-	if err != nil {
-		return nil, err
-	}
-	inboundFunction, ok := goja.AssertFunction(vm.Get("inbound"))
-	if !ok {
-		logger.Fatalln("inbound - Not a function")
-	}
-	outboundFunction, ok := goja.AssertFunction(vm.Get("outbound"))
-	if !ok {
-		logger.Fatalln("outbound - Not a function")
-	}
-
 	script := &ScriptRuntime{
-		vm:               vm,
-		outboundFunction: outboundFunction,
-		inboundFunction:  inboundFunction,
+		vm: vm,
 	}
 
 	return script, nil
@@ -84,6 +70,7 @@ func (runtime *ScriptRuntime) ProcessOutbound(input *OutboundContext) (*Outbound
 
 	return &OutboundOutput{
 		Attributes: obj["attributes"].(map[string]interface{}),
+		NameID:     obj["nameID"].(string),
 	}, nil
 }
 func (runtime *ScriptRuntime) ProcessInbound(input *InboundContext) (*InboundOutput, error) {
@@ -92,11 +79,18 @@ func (runtime *ScriptRuntime) ProcessInbound(input *InboundContext) (*InboundOut
 	if err != nil {
 		return nil, err
 	}
-
 	obj := res.Export().(map[string]interface{})
 
-	return &InboundOutput{
-		AcrValues: obj["acr_values"],
-		Prompt:    obj["prompt"],
-	}, nil
+	output := &InboundOutput{}
+
+	if acrValues, ok := obj["acrValues"]; ok {
+		v := acrValues.([]string)
+		output.AcrValues = &v
+	}
+	if prompt, ok := obj["prompt"]; ok {
+		v := prompt.(string)
+		output.Prompt = &v
+	}
+
+	return output, nil
 }
