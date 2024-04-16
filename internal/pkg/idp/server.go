@@ -45,51 +45,6 @@ type Server struct {
 	serviceProvidersGlob *string
 }
 
-const DEFAULT_SCRIPT string = `
-/*
-SCRIPT FOR OUTBOUND TRAFFIC (FROM OIDC PROVIDER)
-*/
-function outbound(context) {
-
-  const STANDARD_OIDC_CLAIMS = [
-      'iss', 
-      'sub',
-      'aud',
-      'exp',
-      'iat',
-      'auth_time',
-      'nonce',
-      'acr',
-      'amr',
-      'azp'
-  ];
-
-  return {
-      attributes: Object.keys(context.claims)
-          .filter(key => !STANDARD_OIDC_CLAIMS.includes(key))
-          .reduce((obj, key) => {
-            obj[key] = context.claims[key];
-            return obj;
-          }, {}),
-      nameID: context.claims.sub
-  }
-}
-
-/*
-SCRIPT FOR INBOUND TRAFFIC (FROM SAML2 CLIENT)
-*/
-function inbound(context) {
-
-  if(context.forceAuthn){
-      return {
-          prompt: 'login'
-      }
-  }
-
-  return {}
-}
-`
-
 func NewServer(
 	baseUrl url.URL,
 	metadataPath string,
@@ -186,38 +141,27 @@ func NewServer(
 	return server, nil
 }
 
-func randomBytes(n int) []byte {
-	rv := make([]byte, n)
-	if _, err := saml.RandReader.Read(rv); err != nil {
-		panic(err)
-	}
-	return rv
-}
-
-func (server *Server) ReloadScript() {
-
-	var scriptContent string = strings.Clone(DEFAULT_SCRIPT)
-
-	// Load script from file if not nil
-	if server.scriptFile != nil {
-		f, err := os.ReadFile(*server.scriptFile)
-		if err != nil {
-			server.logger.Panicln(err)
-			return
-		}
-		scriptContent = string(f)
-	}
-
-	server.idpConfigMu.Lock()
-	if err := server.scriptRuntime.LoadScript(scriptContent); err != nil {
-		server.logger.Println(err)
-	}
-	server.idpConfigMu.Unlock()
-
-	server.logger.Println("Script successfully loaded:\n" + scriptContent)
-}
-
 func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.IdpAuthnRequest) *saml.Session {
+
+	UpstreamContext := func() *script.UpstreamContext {
+		context := script.NewUpstreamContext()
+
+		context.AcrContext = req.Request.RequestedAuthnContext.AuthnContextClassRef
+
+		if req.Request.ForceAuthn != nil {
+			context.ForceAuthn = *req.Request.ForceAuthn
+		}
+
+		return context
+	}
+
+	DownstreamContext := func(claims map[string]interface{}) *script.DownstreamContext {
+		context := script.NewDownstreamContext()
+
+		context.Claims = claims
+
+		return context
+	}
 
 	if _, err := r.Cookie("_authn"); err != nil {
 
@@ -238,14 +182,7 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 			}
 			http.SetCookie(w, cookie)
 
-			upstreamContext := &script.UpstreamContext{
-				AcrContext: req.Request.RequestedAuthnContext.AuthnContextClassRef,
-			}
-			if req.Request.ForceAuthn != nil {
-				upstreamContext.ForceAuthn = *req.Request.ForceAuthn
-			}
-
-			output, err := server.scriptRuntime.ProcessUpstream(upstreamContext)
+			output, err := server.scriptRuntime.ProcessUpstream(UpstreamContext())
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 			}
@@ -271,7 +208,7 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 		value := make(map[string]string)
 		if err = server.secureCookie.Decode("_authn", cookie.Value, &value); err == nil {
 
-			server.logger.Println("Trying to parse and validate id_token=%s", value["id_token"])
+			server.logger.Printf("Trying to parse and validate id_token=%s", value["id_token"])
 
 			// Parse and verify ID Token payload.
 			idToken, err := server.oidcProvider.Verifier(&oidc.Config{ClientID: server.oauth2Config.ClientID}).Verify(r.Context(), value["id_token"])
@@ -286,9 +223,7 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 				http.Error(w, err.Error(), http.StatusBadRequest)
 			}
 
-			output, err := server.scriptRuntime.ProcessDownstream(&script.DownstreamContext{
-				Claims: claims,
-			})
+			output, err := server.scriptRuntime.ProcessDownstream(DownstreamContext(claims))
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 			}
@@ -319,19 +254,11 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 			}
 
 			session := &saml.Session{
-				ID:         base64.StdEncoding.EncodeToString(randomBytes(32)),
-				CreateTime: saml.TimeNow(),
-				ExpireTime: saml.TimeNow().Add(time.Hour),
-				Index:      hex.EncodeToString(randomBytes(32)),
-				NameID:     output.NameID.(string),
-				/*
-				   Groups:                []string{"group01", "group02"},
-				   UserEmail:             "test@test.com",
-				   UserCommonName:        "UserCommonName",
-				   UserSurname:           "UserSurname",
-				   UserGivenName:         "UserGivenName",
-				   UserScopedAffiliation: "UserScopedAffiliation",
-				*/
+				ID:               base64.StdEncoding.EncodeToString(randomBytes(32)),
+				CreateTime:       saml.TimeNow(),
+				ExpireTime:       saml.TimeNow().Add(time.Hour),
+				Index:            hex.EncodeToString(randomBytes(32)),
+				NameID:           output.NameID.(string),
 				CustomAttributes: attributes,
 			}
 
@@ -423,6 +350,47 @@ func handleOAuth2Callback(server *Server, w http.ResponseWriter, r *http.Request
 
 	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 
+}
+
+func (server *Server) ReloadScript() {
+
+	// Default Script
+	var scriptContent string = `
+		function downstream(context) {
+			return {
+				attributes: Object.keys(context.claims)
+					.filter(key => !context.getStandardClaims().includes(key))
+					.reduce((obj, key) => {
+						obj[key] = context.claims[key];
+						return obj;
+					}, {}),
+				nameID: context.claims.sub
+			}
+		}
+		function upstream(context) {
+			return {
+				prompt: (context.forceAuthn) ? "login": undefined
+			}
+		}
+	`
+
+	// Load script from file if not nil
+	if server.scriptFile != nil && *server.scriptFile != "" {
+		f, err := os.ReadFile(*server.scriptFile)
+		if err != nil {
+			server.logger.Panicln(err)
+			return
+		}
+		scriptContent = string(f)
+	}
+
+	server.idpConfigMu.Lock()
+	if err := server.scriptRuntime.LoadScript(scriptContent); err != nil {
+		server.logger.Println(err)
+	}
+	server.idpConfigMu.Unlock()
+
+	server.logger.Println("Script successfully loaded:\n" + scriptContent)
 }
 
 func (server *Server) ReloadServiceProviders() {

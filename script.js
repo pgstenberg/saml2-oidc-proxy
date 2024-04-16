@@ -1,43 +1,16 @@
-/*
-SCRIPT FOR OUTBOUND TRAFFIC (FROM OIDC PROVIDER)
-*/
-function outbound(context) {
-  const STANDARD_OIDC_CLAIMS = [
-    'iss', 
-    'sub',
-    'aud',
-    'exp',
-    'iat',
-    'auth_time',
-    'nonce',
-    'acr',
-    'amr',
-    'azp'
-  ];
-  return {
-    attributes: Object.keys(context.claims)
-      .filter(key => !STANDARD_OIDC_CLAIMS.includes(key))
-      .reduce((obj, key) => {
-        obj[key] = context.claims[key];
-        return obj;
-      }, {}),
-    nameID: context.claims.sub
-  }
-  
-}
-  
-/*
-SCRIPT FOR INBOUND TRAFFIC (FROM SAML2 CLIENT)
-*/
-function inbound(context) {
-
-  console.log("HELLO WORLD!");
-
-  if(context.forceAuthn){
+function downstream(context) {
     return {
-      prompt: 'login'
+        attributes: Object.keys(context.claims)
+            .filter(key => !context.getStandardClaims().includes(key))
+            .reduce((obj, key) => {
+                    obj[key] = context.claims[key];
+                    return obj;
+            }, {}),
+        nameID: context.claims.sub
     }
-  }
-
-  return {}
+}
+function upstream(context) {
+    return {
+        prompt: (context.forceAuthn) ? "login": undefined
+    }
 }
