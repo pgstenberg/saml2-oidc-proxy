@@ -151,6 +151,7 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 		if req.Request.ForceAuthn != nil {
 			context.ForceAuthn = *req.Request.ForceAuthn
 		}
+		context.EntityID = req.ServiceProviderMetadata.EntityID
 
 		return context
 	}

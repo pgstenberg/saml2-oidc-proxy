@@ -9,6 +9,7 @@ type AbtractContext struct {
 type UpstreamContext struct {
 	*AbtractContext
 	AcrContext string
+	EntityID   string
 	ForceAuthn bool
 }
 type DownstreamContext struct {
