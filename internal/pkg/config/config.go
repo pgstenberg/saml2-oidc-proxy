@@ -1,4 +1,4 @@
-package idp
+package config
 
 import (
 	"fmt"
@@ -23,9 +23,6 @@ type Config struct {
 		ClientId     string `yaml:"client_id", envconfig:"OIDC_CLIENT_ID"`
 		ClientSecret string `yaml:"client_secret", envconfig:"OIDC_CLIENT_SECRET"`
 	} `yaml:"openid_connect_client"`
-	Server struct {
-		Script *string `yaml:"script", envconfig:"SERVER_SCRIPT"`
-	} `yaml:"server"`
 }
 
 func ReadYaml(cfg *Config, filePath string) error {

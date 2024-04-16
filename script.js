@@ -18,8 +18,8 @@ function outbound(context) {
     attributes: Object.keys(context.claims)
       .filter(key => !STANDARD_OIDC_CLAIMS.includes(key))
       .reduce((obj, key) => {
-      obj[key] = context.claims[key];
-      return obj;
+        obj[key] = context.claims[key];
+        return obj;
       }, {}),
     nameID: context.claims.sub
   }

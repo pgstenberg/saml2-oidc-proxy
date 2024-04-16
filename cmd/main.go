@@ -10,10 +10,12 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path/filepath"
 
 	"github.com/crewjam/saml/logger"
 	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/securecookie"
+	"github.com/pgstenberg/saml2-oidc-proxy/internal/pkg/config"
 	"github.com/pgstenberg/saml2-oidc-proxy/internal/pkg/idp"
 	"github.com/zenazn/goji"
 )
@@ -25,17 +27,18 @@ type User struct {
 
 func main() {
 
-	var cfg idp.Config
+	var cfg config.Config
 
 	configFile := flag.String("config", "", "Configuration file to be used.")
 	scriptFile := flag.String("script", "", "Script file to be used.")
+	serviceProvidersGlob := flag.String("serviceproviders", "*.xml", "GLOB for where to find seviceprovide configuration(s).")
 
 	flag.Parse()
-	if *configFile != "" {
-		idp.ReadYaml(&cfg, *configFile)
-	}
 
-	idp.ReadEnv(&cfg)
+	if configFile != nil {
+		config.ReadYaml(&cfg, *configFile)
+	}
+	config.ReadEnv(&cfg)
 
 	logr := logger.DefaultLogger
 
@@ -72,13 +75,16 @@ func main() {
 		cfg.OpenIdConnectClient.ClientId,
 		cfg.OpenIdConnectClient.ClientSecret,
 		sc,
+		scriptFile,
+		serviceProvidersGlob,
 	)
-
-	idpServer.LoadScript(scriptFile)
 
 	if err != nil {
 		logr.Fatalf("%s", err)
 	}
+
+	idpServer.ReloadScript()
+	idpServer.ReloadServiceProviders()
 
 	// Create new watcher.
 	watcher, err := fsnotify.NewWatcher()
@@ -95,8 +101,15 @@ func main() {
 				if !ok {
 					return
 				}
-				if event.Has(fsnotify.Write) && event.Name == *scriptFile {
-					idpServer.LoadScript(scriptFile)
+				if event.Has(fsnotify.Write) {
+					// Scriptfile updated.
+					if event.Name == *scriptFile {
+						idpServer.ReloadScript()
+					}
+					// Any service providers was updated.
+					if match, err := filepath.Match(*serviceProvidersGlob, event.Name); match && err != nil {
+						idpServer.ReloadServiceProviders()
+					}
 				}
 			case err, ok := <-watcher.Errors:
 				if !ok {

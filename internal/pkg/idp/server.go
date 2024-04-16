@@ -22,9 +22,9 @@ import (
 	"github.com/coreos/go-oidc"
 	"github.com/crewjam/saml"
 	"github.com/crewjam/saml/logger"
-	"github.com/dop251/goja"
 	"github.com/google/uuid"
 	"github.com/gorilla/securecookie"
+	"github.com/pgstenberg/saml2-oidc-proxy/internal/pkg/script"
 	"github.com/zenazn/goji/web"
 	"golang.org/x/oauth2"
 
@@ -33,43 +33,45 @@ import (
 
 type Server struct {
 	http.Handler
-	idpConfigMu      sync.RWMutex // protects calls into the IDP
-	serviceProviders map[string]*saml.EntityDescriptor
-	Idp              saml.IdentityProvider // the underlying IDP
-	oauth2Config     oauth2.Config
-	oidcProvider     *oidc.Provider
-	secureCookie     *securecookie.SecureCookie
-	logger           logger.Interface
-	scriptRuntime    *ScriptRuntime
+	idpConfigMu          sync.RWMutex // protects calls into the IDP
+	serviceProviders     map[string]*saml.EntityDescriptor
+	Idp                  saml.IdentityProvider // the underlying IDP
+	oauth2Config         oauth2.Config
+	oidcProvider         *oidc.Provider
+	secureCookie         *securecookie.SecureCookie
+	logger               logger.Interface
+	scriptRuntime        *script.Runtime
+	scriptFile           *string
+	serviceProvidersGlob *string
 }
 
-const DEFAULT_SCRIPT = `
+const DEFAULT_SCRIPT string = `
 /*
 SCRIPT FOR OUTBOUND TRAFFIC (FROM OIDC PROVIDER)
 */
 function outbound(context) {
 
   const STANDARD_OIDC_CLAIMS = [
-	  'iss', 
-	  'sub',
-	  'aud',
-	  'exp',
-	  'iat',
-	  'auth_time',
-	  'nonce',
-	  'acr',
-	  'amr',
-	  'azp'
+      'iss', 
+      'sub',
+      'aud',
+      'exp',
+      'iat',
+      'auth_time',
+      'nonce',
+      'acr',
+      'amr',
+      'azp'
   ];
 
   return {
-	  attributes: Object.keys(context.claims)
-		  .filter(key => !STANDARD_OIDC_CLAIMS.includes(key))
-		  .reduce((obj, key) => {
-			obj[key] = context.claims[key];
-			return obj;
-		  }, {}),
-	  nameID: context.claims.sub
+      attributes: Object.keys(context.claims)
+          .filter(key => !STANDARD_OIDC_CLAIMS.includes(key))
+          .reduce((obj, key) => {
+            obj[key] = context.claims[key];
+            return obj;
+          }, {}),
+      nameID: context.claims.sub
   }
 }
 
@@ -79,9 +81,9 @@ SCRIPT FOR INBOUND TRAFFIC (FROM SAML2 CLIENT)
 function inbound(context) {
 
   if(context.forceAuthn){
-	  return {
-		  prompt: 'login'
-	  }
+      return {
+          prompt: 'login'
+      }
   }
 
   return {}
@@ -100,6 +102,8 @@ func NewServer(
 	oidcClient string,
 	oidcClientSecret string,
 	secureCookie *securecookie.SecureCookie,
+	scriptFile *string,
+	serviceProvidersGlob *string,
 ) (*Server, error) {
 
 	if len(metadataPath) == 0 {
@@ -119,7 +123,7 @@ func NewServer(
 		return nil, err
 	}
 
-	scriptRuntime, err := NewScriptRuntime(logger)
+	scriptRuntime, err := script.NewRuntime(logger)
 	if err != nil {
 		return nil, err
 	}
@@ -146,16 +150,16 @@ func NewServer(
 			// "openid" is a required scope for OpenID Connect flows.
 			Scopes: []string{oidc.ScopeOpenID, "profile", "email"},
 		},
-		oidcProvider:  oidcProvider,
-		secureCookie:  secureCookie,
-		logger:        logger,
-		scriptRuntime: scriptRuntime,
+		oidcProvider:         oidcProvider,
+		secureCookie:         secureCookie,
+		logger:               logger,
+		scriptRuntime:        scriptRuntime,
+		scriptFile:           scriptFile,
+		serviceProvidersGlob: serviceProvidersGlob,
 	}
 
 	server.Idp.SessionProvider = server
 	server.Idp.ServiceProviderProvider = server
-
-	server.loadServiceProviders()
 
 	/**
 	    WEBSERVICE
@@ -179,8 +183,6 @@ func NewServer(
 		handleOAuth2Callback(server, w, r)
 	})
 
-	server.logger.Println("SP loaded=%s", server.serviceProviders)
-
 	return server, nil
 }
 
@@ -192,42 +194,27 @@ func randomBytes(n int) []byte {
 	return rv
 }
 
-func (server *Server) LoadScript(scriptFile *string) {
+func (server *Server) ReloadScript() {
 
-	if scriptFile == nil || *scriptFile == "" {
-		defaultScript := DEFAULT_SCRIPT
-		server.scriptRuntime.script = &defaultScript
-		server.logger.Println("Script successfully loaded:\n" + *server.scriptRuntime.script)
-		return
+	var scriptContent string = strings.Clone(DEFAULT_SCRIPT)
+
+	// Load script from file if not nil
+	if server.scriptFile != nil {
+		f, err := os.ReadFile(*server.scriptFile)
+		if err != nil {
+			server.logger.Panicln(err)
+			return
+		}
+		scriptContent = string(f)
 	}
 
-	f, err := os.ReadFile(*scriptFile)
-	if err != nil {
-		server.logger.Panicln(err)
-		return
-	}
-	scriptContent := string(f)
-
-	if scriptContent == "" {
-		return
-	}
-
-	_, err = server.scriptRuntime.vm.RunString(scriptContent)
-	if err != nil {
+	server.idpConfigMu.Lock()
+	if err := server.scriptRuntime.LoadScript(scriptContent); err != nil {
 		server.logger.Println(err)
-		return
 	}
+	server.idpConfigMu.Unlock()
 
-	server.scriptRuntime.script = &scriptContent
-
-	if inboundFunction, ok := goja.AssertFunction(server.scriptRuntime.vm.Get("inbound")); ok {
-		server.scriptRuntime.inboundFunction = inboundFunction
-	}
-	if outboundFunction, ok := goja.AssertFunction(server.scriptRuntime.vm.Get("outbound")); ok {
-		server.scriptRuntime.outboundFunction = outboundFunction
-	}
-
-	server.logger.Println("Script successfully loaded:\n" + *server.scriptRuntime.script)
+	server.logger.Println("Script successfully loaded:\n" + scriptContent)
 }
 
 func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.IdpAuthnRequest) *saml.Session {
@@ -251,14 +238,14 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 			}
 			http.SetCookie(w, cookie)
 
-			inboundContext := &InboundContext{
+			upstreamContext := &script.UpstreamContext{
 				AcrContext: req.Request.RequestedAuthnContext.AuthnContextClassRef,
 			}
 			if req.Request.ForceAuthn != nil {
-				inboundContext.ForceAuthn = *req.Request.ForceAuthn
+				upstreamContext.ForceAuthn = *req.Request.ForceAuthn
 			}
 
-			output, err := server.scriptRuntime.ProcessInbound(inboundContext)
+			output, err := server.scriptRuntime.ProcessUpstream(upstreamContext)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 			}
@@ -299,7 +286,7 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 				http.Error(w, err.Error(), http.StatusBadRequest)
 			}
 
-			output, err := server.scriptRuntime.ProcessOutbound(&OutboundContext{
+			output, err := server.scriptRuntime.ProcessDownstream(&script.DownstreamContext{
 				Claims: claims,
 			})
 			if err != nil {
@@ -438,26 +425,59 @@ func handleOAuth2Callback(server *Server, w http.ResponseWriter, r *http.Request
 
 }
 
-func (server *Server) loadServiceProviders() {
-	pattern := "*.xml"
-	files, err := filepath.Glob(pattern)
+func (server *Server) ReloadServiceProviders() {
+	files, err := filepath.Glob(*server.serviceProvidersGlob)
 	if err != nil {
 		server.logger.Fatalln(err)
 		return
 	}
-	server.logger.Println("Found SP configuration=%s", files)
+
+	metadata := func(r io.Reader) (spMetadata *saml.EntityDescriptor, err error) {
+		var data []byte
+		if data, err = io.ReadAll(r); err != nil {
+			return nil, err
+		}
+
+		spMetadata = &saml.EntityDescriptor{}
+		if err := xrv.Validate(bytes.NewBuffer(data)); err != nil {
+			return nil, err
+		}
+
+		if err := xml.Unmarshal(data, &spMetadata); err != nil {
+			if err.Error() == "expected element type <EntityDescriptor> but have <EntitiesDescriptor>" {
+				entities := &saml.EntitiesDescriptor{}
+				if err := xml.Unmarshal(data, &entities); err != nil {
+					return nil, err
+				}
+
+				for _, e := range entities.EntityDescriptors {
+					if len(e.SPSSODescriptors) > 0 {
+						return &e, nil
+					}
+				}
+
+				// there were no SPSSODescriptors in the response
+				return nil, errors.New("metadata contained no service provider metadata")
+			}
+
+			return nil, err
+		}
+
+		return spMetadata, nil
+	}
 
 	for _, f := range files {
 		reader, err := os.Open(f)
 
 		if err != nil {
-			server.logger.Fatalln(err)
+			server.logger.Println(err)
 			return
 		}
 
-		metadata, err := getSPMetadata(reader)
+		metadata, err := metadata(reader)
+
 		if err != nil {
-			server.logger.Fatalln(err)
+			server.logger.Println(err)
 			return
 		}
 
@@ -466,40 +486,8 @@ func (server *Server) loadServiceProviders() {
 		server.idpConfigMu.Unlock()
 
 		reader.Close()
+
+		server.logger.Printf("Successfully loaded; file=%s, entityid=%s", files, metadata.EntityID)
 	}
 
-}
-
-func getSPMetadata(r io.Reader) (spMetadata *saml.EntityDescriptor, err error) {
-	var data []byte
-	if data, err = io.ReadAll(r); err != nil {
-		return nil, err
-	}
-
-	spMetadata = &saml.EntityDescriptor{}
-	if err := xrv.Validate(bytes.NewBuffer(data)); err != nil {
-		return nil, err
-	}
-
-	if err := xml.Unmarshal(data, &spMetadata); err != nil {
-		if err.Error() == "expected element type <EntityDescriptor> but have <EntitiesDescriptor>" {
-			entities := &saml.EntitiesDescriptor{}
-			if err := xml.Unmarshal(data, &entities); err != nil {
-				return nil, err
-			}
-
-			for _, e := range entities.EntityDescriptors {
-				if len(e.SPSSODescriptors) > 0 {
-					return &e, nil
-				}
-			}
-
-			// there were no SPSSODescriptors in the response
-			return nil, errors.New("metadata contained no service provider metadata")
-		}
-
-		return nil, err
-	}
-
-	return spMetadata, nil
 }
