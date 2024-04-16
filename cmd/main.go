@@ -31,7 +31,7 @@ func main() {
 
 	configFile := flag.String("config", "", "Configuration file to be used.")
 	scriptFile := flag.String("script", "", "Script file to be used.")
-	serviceProvidersGlob := flag.String("serviceproviders", "*.xml", "GLOB for where to find seviceprovide configuration(s).")
+	serviceProvidersGlob := flag.String("serviceproviders", "./*.xml", "GLOB for where to find seviceprovide configuration(s).")
 
 	flag.Parse()
 
@@ -101,13 +101,15 @@ func main() {
 				if !ok {
 					return
 				}
+				// Script file was updated.
 				if event.Has(fsnotify.Write) {
-					// Scriptfile updated.
 					if event.Name == *scriptFile {
 						idpServer.ReloadScript()
 					}
-					// Any service providers was updated.
-					if match, err := filepath.Match(*serviceProvidersGlob, event.Name); match && err != nil {
+				}
+				// Any service providers was updated or created.
+				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+					if match, _ := filepath.Match(*serviceProvidersGlob, event.Name); match {
 						idpServer.ReloadServiceProviders()
 					}
 				}
