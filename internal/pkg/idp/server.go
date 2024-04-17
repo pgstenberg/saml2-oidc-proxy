@@ -135,10 +135,41 @@ func NewServer(
 	mux.Handle("/oauth/v2/callback", func(w http.ResponseWriter, r *http.Request) {
 		server.idpConfigMu.RLock()
 		defer server.idpConfigMu.RUnlock()
-		handleOAuth2Callback(server, w, r)
+		serveCallback(server, w, r)
 	})
 
 	return server, nil
+}
+
+func clearCookies(w http.ResponseWriter) {
+	// Remove session cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:    "_session",
+		Value:   "",
+		Path:    "/",
+		Expires: time.Unix(0, 0),
+
+		HttpOnly: true,
+	})
+	// Remove authn cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:    "_authn",
+		Value:   "",
+		Path:    "/",
+		Expires: time.Unix(0, 0),
+
+		HttpOnly: true,
+	})
+}
+
+const (
+	HttpMessageInternalServerError = "INTERNAL_SERVER_ERROR"
+	httpMessageFederationFailed    = "FEDERATION_FAILED"
+)
+
+func httpError(msg string, errorType int, err error, w http.ResponseWriter, lgr logger.Interface) {
+	lgr.Println(err.Error())
+	http.Error(w, msg, errorType)
 }
 
 func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *saml.IdpAuthnRequest) *saml.Session {
@@ -185,7 +216,8 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 
 			output, err := server.scriptRuntime.ProcessUpstream(UpstreamContext())
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				clearCookies(w)
+				httpError(HttpMessageInternalServerError, http.StatusInternalServerError, err, w, server.logger)
 			}
 
 			opts := []oauth2.AuthCodeOption{}
@@ -215,18 +247,21 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 			idToken, err := server.oidcProvider.Verifier(&oidc.Config{ClientID: server.oauth2Config.ClientID}).Verify(r.Context(), value["id_token"])
 
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				clearCookies(w)
+				httpError(httpMessageFederationFailed, http.StatusBadRequest, err, w, server.logger)
 			}
 
 			// Extract custom claims
 			var claims map[string]interface{}
 			if err := idToken.Claims(&claims); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				clearCookies(w)
+				httpError(httpMessageFederationFailed, http.StatusBadRequest, err, w, server.logger)
 			}
 
 			output, err := server.scriptRuntime.ProcessDownstream(DownstreamContext(claims))
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
+				clearCookies(w)
+				httpError(HttpMessageInternalServerError, http.StatusInternalServerError, err, w, server.logger)
 			}
 
 			attributes := []saml.Attribute{}
@@ -263,24 +298,7 @@ func (server *Server) GetSession(w http.ResponseWriter, r *http.Request, req *sa
 				CustomAttributes: attributes,
 			}
 
-			// Remove session cookie
-			http.SetCookie(w, &http.Cookie{
-				Name:    "_session",
-				Value:   "",
-				Path:    "/",
-				Expires: time.Unix(0, 0),
-
-				HttpOnly: true,
-			})
-			// Remove authn cookie
-			http.SetCookie(w, &http.Cookie{
-				Name:    "_authn",
-				Value:   "",
-				Path:    "/",
-				Expires: time.Unix(0, 0),
-
-				HttpOnly: true,
-			})
+			clearCookies(w)
 
 			return session
 		}
@@ -300,7 +318,7 @@ func (server *Server) GetServiceProvider(_ *http.Request, serviceProviderID stri
 	return rv, nil
 }
 
-func handleOAuth2Callback(server *Server, w http.ResponseWriter, r *http.Request) {
+func serveCallback(server *Server, w http.ResponseWriter, r *http.Request) {
 
 	if cookie, err := r.Cookie("_session"); err == nil {
 
@@ -313,21 +331,21 @@ func handleOAuth2Callback(server *Server, w http.ResponseWriter, r *http.Request
 			server.logger.Println("SAMLRequest=%s, state=%s", samlRequest, state)
 
 			if r.URL.Query().Get("state") != state {
-				server.logger.Println("state=%s, did not match state=%s", state, r.URL.Query().Get("state"))
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				clearCookies(w)
+				httpError(httpMessageFederationFailed, http.StatusBadRequest, fmt.Errorf("state=%s, did not match state=%s", state, r.URL.Query().Get("state")), w, server.logger)
 			}
 
 			oauth2Token, err := server.oauth2Config.Exchange(r.Context(), r.URL.Query().Get("code"))
 			if err != nil {
-				server.logger.Println(err.Error())
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				clearCookies(w)
+				httpError(httpMessageFederationFailed, http.StatusBadRequest, err, w, server.logger)
 			}
 
 			// Extract the ID Token from OAuth2 token.
 			rawIDToken, ok := oauth2Token.Extra("id_token").(string)
 			if !ok {
-				server.logger.Println("Invalid id_token")
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				clearCookies(w)
+				httpError(httpMessageFederationFailed, http.StatusBadRequest, fmt.Errorf("invalid id_token"), w, server.logger)
 			}
 
 			value := map[string]string{
@@ -349,7 +367,8 @@ func handleOAuth2Callback(server *Server, w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	clearCookies(w)
+	httpError(httpMessageFederationFailed, http.StatusBadRequest, fmt.Errorf("no _session cookie found"), w, server.logger)
 
 }
 
