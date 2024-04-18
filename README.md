@@ -69,7 +69,7 @@ function downstream(context) {
 }
 function upstream(context) {
   return {
-    prompt: (context.forceAuthn) ? "login"undefined
+    prompt: (context.forceAuthn) ? "login": undefined
   }
 }
 ```
