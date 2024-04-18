@@ -22,3 +22,6 @@ go.work
 
 # SP configs
 *.xml
+
+# Ignore compiled binary
+saml2-oidc-proxy
