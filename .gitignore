@@ -22,6 +22,15 @@ go.work
 
 # SP configs
 *.xml
+!sp.example.xml
+
+# Configs
+*.yaml
+!config.example.yaml
+
+# Scripts
+*.js
+!script.example.js
 
 # Ignore compiled binary
 saml2-oidc-proxy

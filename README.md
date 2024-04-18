@@ -57,20 +57,20 @@ Custom scripting can be using specificed `.js` file, the file need to contain tw
 
 ```js
 function downstream(context) {
-	return {
-		attributes: Object.keys(context.claims)
-			.filter(key => !contex.getStandardClaims().includes(key))
-			.reduce((obj, key) => {
-				obj[key] = context.claims[key];
-				return obj;
-			}, {}),
-		nameID: context.claims.sub
-	}
+  return {
+    attributes: Object.keys(context.claims)
+      .filter(key => !contex.getStandardClaims().includes(key))
+      .reduce((obj, key) => {
+        obj[key] = context.claims[key];
+        return obj;
+      }, {}),
+      nameID: context.claims.sub
+  }
 }
 function upstream(context) {
-	return {
-		prompt: (context.forceAuthn) ? "login"undefined
-	}
+  return {
+    prompt: (context.forceAuthn) ? "login"undefined
+  }
 }
 ```
 
